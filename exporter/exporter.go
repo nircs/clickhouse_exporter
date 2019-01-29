@@ -23,12 +23,14 @@ const (
 // Exporter collects clickhouse stats from the given URI and exports them using
 // the prometheus metrics package.
 type Exporter struct {
-	metricsURI      string
-	asyncMetricsURI string
-	eventsURI       string
-	partsURI        string
-	mutex           sync.RWMutex
-	client          *http.Client
+	metricsURI        string
+	asyncMetricsURI   string
+	eventsURI         string
+	partsURI          string
+	partsPartitionURI string
+	replicasURI       string
+	mutex             sync.RWMutex
+	client            *http.Client
 
 	scrapeFailures prometheus.Counter
 
@@ -57,12 +59,27 @@ func NewExporter(uri url.URL, insecure bool, user, password string) *Exporter {
 	partsURI := uri
 	q.Set("query", "select database, table, sum(bytes) as bytes, count() as parts, sum(rows) as rows from system.parts where active = 1 group by database, table")
 	partsURI.RawQuery = q.Encode()
-	
+
+	partsPartitionURI := uri
+	q.Set("query", "select database, table, partition, sum(bytes) as bytes, count() as parts, sum(rows) as rows from system.parts where active = 1 group by database, table, partition")
+	partsPartitionURI.RawQuery = q.Encode()
+
+	replicasURI := uri
+
+	var replicaMetrics = NewReplicaMetrics()
+
+	queryString := "select database, table, " + replicaMetrics.listMetrics() + " from system.replicas"
+
+	q.Set("query", queryString)
+	replicasURI.RawQuery = q.Encode()
+
 	return &Exporter{
-		metricsURI:      metricsURI.String(),
-		asyncMetricsURI: asyncMetricsURI.String(),
-		eventsURI:       eventsURI.String(),
-		partsURI:        partsURI.String(),
+		metricsURI:        metricsURI.String(),
+		asyncMetricsURI:   asyncMetricsURI.String(),
+		eventsURI:         eventsURI.String(),
+		partsURI:          partsURI.String(),
+		partsPartitionURI: partsPartitionURI.String(),
+		replicasURI:       replicasURI.String(),
 		scrapeFailures: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "exporter_scrape_failures_total",
@@ -179,7 +196,48 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 		newRowsMetric.Collect(ch)
 	}
 
+	partsPartition, err := e.parsePartsPartitionResponse(e.partsPartitionURI)
+	if err != nil {
+		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.partsPartitionURI, err)
+	}
+
+	for _, part := range partsPartition {
+		newBytesMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "table_parts_partition_bytes",
+			Help:      "Table size in bytes per partition",
+		}, []string{"database", "table", "partition"}).WithLabelValues(part.database, part.table, part.partition)
+		newBytesMetric.Set(float64(part.bytes))
+		newBytesMetric.Collect(ch)
+
+		newCountMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "table_parts_partition_count",
+			Help:      "Number of parts of the table per partition",
+		}, []string{"database", "table", "partition"}).WithLabelValues(part.database, part.table, part.partition)
+		newCountMetric.Set(float64(part.parts))
+		newCountMetric.Collect(ch)
+
+		newRowsMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "table_parts_partition_rows",
+			Help:      "Number of rows in the table per partition",
+		}, []string{"database", "table", "partition"}).WithLabelValues(part.database, part.table, part.partition)
+		newRowsMetric.Set(float64(part.rows))
+		newRowsMetric.Collect(ch)
+	}
+
+	replicas, err := e.parseReplicasResponse(e.replicasURI)
+	if err != nil {
+		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.replicasURI, err)
+	}
+
+	for _, r := range replicas {
+		r.exposeMetrics(ch)
+	}
+
 	return nil
+
 }
 
 func (e *Exporter) handleResponse(uri string) ([]byte, error) {
@@ -204,7 +262,7 @@ func (e *Exporter) handleResponse(uri string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("Status %s (%d): %s", resp.Status, resp.StatusCode, data)
 	}
-	
+
 	return data, nil
 }
 
